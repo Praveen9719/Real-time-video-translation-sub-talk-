@@ -1,0 +1,252 @@
+import os
+import cv2
+import time
+import threading
+import pygame
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+from PIL import Image, ImageTk
+from pydub import AudioSegment, silence
+from gtts import gTTS
+import speech_recognition as sr
+from googletrans import Translator
+from moviepy.editor import VideoFileClip, AudioFileClip
+
+pygame.mixer.init()
+
+# ------------------ AUDIO PROCESSING ------------------
+
+def extract_audio(video_path, audio_path="temp_audio.wav"):
+    video = VideoFileClip(video_path)
+    video.audio.write_audiofile(audio_path)
+    return audio_path
+
+
+def process_audio_chunks_with_silence(audio_path):
+    recognizer = sr.Recognizer()
+    translator = Translator()
+    audio = AudioSegment.from_wav(audio_path)
+
+    chunks = silence.split_on_silence(
+        audio,
+        min_silence_len=500,
+        silence_thresh=audio.dBFS - 14,
+        keep_silence=300
+    )
+
+    translated_segments = []
+
+    for chunk in chunks:
+        duration = len(chunk)
+        chunk_path = "temp_chunk.wav"
+        chunk.export(chunk_path, format="wav")
+
+        with sr.AudioFile(chunk_path) as source:
+            audio_data = recognizer.record(source)
+            try:
+                english_text = recognizer.recognize_google(audio_data)
+                hindi_text = translator.translate(english_text, dest='hi').text
+
+                tts = gTTS(hindi_text, lang='hi')
+                tts_path = "tts_chunk.mp3"
+                tts.save(tts_path)
+
+                tts_audio = AudioSegment.from_mp3(tts_path)
+                translated_segments.append(tts_audio)
+            except Exception as e:
+                print(f"⚠ Failed to process chunk: {e}")
+                translated_segments.append(AudioSegment.silent(duration=duration))
+
+        os.remove(chunk_path)
+        if os.path.exists("tts_chunk.mp3"):
+            os.remove("tts_chunk.mp3")
+
+    full_hindi_audio = AudioSegment.empty()
+    for i, chunk in enumerate(chunks):
+        if i > 0:
+            full_hindi_audio += AudioSegment.silent(duration=300)
+        full_hindi_audio += translated_segments[i]
+
+    output_path = "translated_audio_synced.wav"
+    full_hindi_audio.export(output_path, format="wav")
+    return output_path
+
+
+def merge_audio_with_video(video_path, new_audio_path, output_video="output_video.mp4"):
+    video = VideoFileClip(video_path)
+    new_audio = AudioFileClip(new_audio_path)
+    new_video = video.set_audio(new_audio)
+    new_video.write_videofile(output_video, codec="libx264", audio_codec="aac")
+    return output_video
+
+
+def translate_video_to_hindi_synced(video_path):
+    try:
+        audio_path = extract_audio(video_path)
+        hindi_audio_path = process_audio_chunks_with_silence(audio_path)
+        final_path = merge_audio_with_video(video_path, hindi_audio_path)
+        return final_path
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+# ------------------ VIDEO PLAYER ------------------
+
+is_playing = False
+is_muted = False
+cap = None
+audio_channel = None
+video_duration = 0
+
+def play_video_with_controls(video_path):
+    global cap, is_playing, video_duration
+
+    if cap:
+        cap.release()
+
+    # Extract audio from video
+    audio_path = "extracted_audio.wav"
+    video_clip = VideoFileClip(video_path)
+    video_clip.audio.write_audiofile(audio_path)
+
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_duration = total_frames / fps
+
+    # Start audio using pygame
+    pygame.mixer.music.load(audio_path)
+    pygame.mixer.music.play()
+
+    def stream():
+        global is_playing
+        is_playing = True
+        current_frame = 0
+
+        while cap.isOpened() and is_playing:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.resize(frame, (640, 360))
+            img = Image.fromarray(frame)
+            imgtk = ImageTk.PhotoImage(image=img)
+
+            video_label.imgtk = imgtk
+            video_label.configure(image=imgtk)
+
+            progress = (current_frame / total_frames) * 100
+            progress_var.set(progress)
+            current_frame += 1
+
+            time.sleep(1 / fps)
+
+        cap.release()
+        pygame.mixer.music.stop()
+        os.remove(audio_path)
+
+    threading.Thread(target=stream, daemon=True).start()
+
+
+def toggle_play_pause():
+    global is_playing
+    if is_playing:
+        is_playing = False
+        pygame.mixer.music.pause()
+        play_pause_btn.configure(text="▶ Play")
+    else:
+        is_playing = True
+        pygame.mixer.music.unpause()
+        play_pause_btn.configure(text="⏸ Pause")
+
+
+
+def toggle_mute():
+    global is_muted
+    is_muted = not is_muted
+    pygame.mixer.music.set_volume(0 if is_muted else 1)
+    mute_btn.configure(text="🔇 Mute" if not is_muted else "🔊 Unmute")
+
+# ------------------ GUI HANDLERS ------------------
+
+def browse_file():
+    file_path = filedialog.askopenfilename(filetypes=[("Video files", "*.mp4 *.mov *.avi")])
+    if file_path:
+        entry.set(file_path)
+
+
+def run_translation():
+    global current_video_path
+    video_path = entry.get()
+    if not video_path or not os.path.exists(video_path):
+        messagebox.showerror("Error", "Please select a valid video file.")
+        return
+
+    button_translate.configure(state="disabled")
+    label_status.configure(text="Translating... Please wait.", text_color="orange")
+    app.update()
+
+    result = translate_video_to_hindi_synced(video_path)
+
+    button_translate.configure(state="normal")
+    if "Error" in result:
+        label_status.configure(text="Translation failed.", text_color="red")
+        messagebox.showerror("Error", result)
+    else:
+        label_status.configure(text="Translation complete! Playing video...", text_color="green")
+        messagebox.showinfo("Success", f"Translated video saved at:\n{result}")
+        current_video_path = result
+        play_video_with_controls(result)
+
+
+# ------------------ CUSTOM TKINTER GUI ------------------
+
+ctk.set_appearance_mode("System")
+ctk.set_default_color_theme("blue")
+
+app = ctk.CTk()
+app.geometry("900x750")
+app.title("SubTalk")
+
+frame = ctk.CTkFrame(app, corner_radius=10)
+frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+label = ctk.CTkLabel(frame, text="Select a Video File", font=ctk.CTkFont(size=18, weight="bold"))
+label.pack(pady=(10, 5))
+
+entry = ctk.StringVar()
+entry_box = ctk.CTkEntry(frame, textvariable=entry, width=500)
+entry_box.pack(pady=5)
+
+button_browse = ctk.CTkButton(frame, text="Browse", command=browse_file)
+button_browse.pack(pady=(5, 10))
+
+button_translate = ctk.CTkButton(frame, text="Translate to Hindi", command=run_translation)
+button_translate.pack(pady=10)
+
+label_status = ctk.CTkLabel(frame, text="", font=ctk.CTkFont(size=14))
+label_status.pack(pady=10)
+
+# Video Display Area
+video_label = ctk.CTkLabel(frame, text="")
+video_label.pack(pady=10)
+
+# --- Controls ---
+controls_frame = ctk.CTkFrame(frame)
+controls_frame.pack(pady=10)
+
+play_pause_btn = ctk.CTkButton(controls_frame, text="▶ Play", command=toggle_play_pause)
+play_pause_btn.pack(side="left", padx=10)
+
+mute_btn = ctk.CTkButton(controls_frame, text="🔇 Mute", command=toggle_mute)
+mute_btn.pack(side="left", padx=10)
+
+# --- Progress Bar ---
+progress_var = ctk.DoubleVar()
+progress_bar = ctk.CTkProgressBar(frame, variable=progress_var, width=400)
+progress_bar.set(0)
+progress_bar.pack(pady=10)
+
+current_video_path = ""
+
+app.mainloop()
